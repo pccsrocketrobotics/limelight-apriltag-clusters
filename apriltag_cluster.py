@@ -16,25 +16,30 @@ with the cluster center as the origin. The pose is rotated into a level frame
 using the camera pitch; range, bearing, height and elevation come from the
 cluster center's position, and sticker pitch and roll from its rotation.
 
-llrobot[0]: alliance. 1 = red (clusters 30, 34), 0 = blue (clusters 38, 42).
-Blue is the default, since llrobot is all zeros until the robot sets it.
-llrobot[1]: camera pitch in degrees, + = tilted up (0 = level, 90 = straight
+llrobot[0]: 0 = no robot inputs: use DEFAULT_ALLIANCE and CAM_PITCH (set at the
+top of the script). The inputs are all zeros until the robot sends something.
+Any other value (the Java code sends 1) = use llrobot[1] and llrobot[2].
+llrobot[1]: alliance filter. 0 = any (all 4 clusters), 1 = blue (clusters 38,
+42), 2 = red (clusters 30, 34).
+llrobot[2]: camera pitch in degrees, + = tilted up (0 = level, 90 = straight
 up). Outputs are corrected to a level frame, as if the camera were level.
-Only that alliance's two clusters are tracked; if both are visible, the closer
+Only the allowed clusters are tracked; if several are visible, the closest
 one (the one containing the biggest tag in the image) is reported.
+
+All angles, inputs and outputs, are in degrees (never radians).
 
 llpython:
     [0] cluster base ID (-1 if none)
     [1] number of tags seen (0-4)
     [2] range: horizontal distance along the floor to the cluster center (in)
-    [3] bearing (deg, + = left, like the FTC SDK) = atan(-right / forward)
+    [3] bearing (degrees, + = left, like the FTC SDK) = atan(-right / forward)
     [4] height of the cluster center above the camera lens (in)
-    [5] elevation (deg, + = up) = atan(height / forward)
-    [6] sticker pitch (deg): tilt of the sticker from flat. 0 = facing straight
+    [5] elevation (degrees, + = up) = atan(height / forward)
+    [6] sticker pitch (degrees): tilt of the sticker from flat. 0 = facing straight
         down, + = tilted to face toward the camera, 90 = facing the camera
-    [7] roll (deg, |roll| < 90 = right-side up in the image)
-Right and forward can be recovered: right = -range*sin(bearing),
-forward = range*cos(bearing).
+    [7] roll (degrees, |roll| < 90 = right-side up in the image)
+Right and forward can be recovered (convert bearing to radians for sin/cos):
+right = -range*sin(bearing), forward = range*cos(bearing).
 
 Provided by Rocket Robotics, FTC 21615
 Copyright (c) 2026 Maxim Vanier
@@ -54,15 +59,26 @@ DECIMATE = 2.0
 # 1 = draw the readout box on the stream, 0 = skip it (faster, e.g. for matches)
 READOUT = 1
 
+# 1 = Limelight mounted upside down: the image is rotated 180 degrees for analysis and
+# rotated back after drawing. Set Stream Orientation to Upside-down to view it.
+UPSIDE_DOWN = 0
+
+# Used while llrobot[0] is 0 (no robot inputs, e.g. testing over USB).
+DEFAULT_ALLIANCE = 0  # 0 = any, 1 = blue, 2 = red
+CAM_PITCH = 30.0      # camera pitch in degrees, + = tilted up
+
 TAG_CENTER_X = (-6.5, -2.75, 2.75, 6.5)
 HALF = 3.25 / 2
 RED_CLUSTERS, BLUE_CLUSTERS = (30, 34), (38, 42)
+# alliance input -> (name, clusters tracked)
+ALLIANCES = {0: ("ANY", RED_CLUSTERS + BLUE_CLUSTERS),
+             1: ("BLUE", BLUE_CLUSTERS), 2: ("RED", RED_CLUSTERS)}
 CLUSTER_NAMES = {30: "RED SCORING", 34: "RED AUDIENCE",
                  38: "BLUE AUDIENCE", 42: "BLUE SCORING"}
 NO_TARGET = [-1, 0, 0, 0, 0, 0, 0, 0]
 
 # Readout colors (BGR)
-RED_TEXT, BLUE_TEXT = (90, 90, 255), (255, 170, 60)
+RED_TEXT, BLUE_TEXT, ANY_TEXT = (90, 90, 255), (255, 170, 60), (230, 230, 230)
 LABEL_TEXT, VALUE_TEXT = (170, 170, 170), (255, 255, 255)
 
 # Camera calibration from default.cal (measured at 1280x960). Scaled to the
@@ -90,6 +106,7 @@ MIN_DECISION_MARGIN = 20.0
 MAX_HAMMING = 1
 
 _K_cache = {}
+_model_cache = {}
 
 
 def camera_matrix(width):
@@ -101,18 +118,39 @@ def camera_matrix(width):
     return _K_cache[width]
 
 
-def draw_readout(image, is_red, cam_pitch, out):
+def camera_model(width, height):
+    """(K, distortion) for the image the pipeline analyzes. When UPSIDE_DOWN,
+    that image is the sensor image rotated 180 degrees: the principal point moves to
+    the opposite side and the tangential terms p1, p2 change sign."""
+    key = (width, height, UPSIDE_DOWN)
+    if key not in _model_cache:
+        K, D = camera_matrix(width).copy(), CAL_DIST.copy()
+        if UPSIDE_DOWN:
+            K[0, 2] = (width - 1) - K[0, 2]
+            K[1, 2] = (height - 1) - K[1, 2]
+            D[2:4] = -D[2:4]
+        _model_cache[key] = (K, D)
+    return _model_cache[key]
+
+
+def draw_readout(image, alliance, cam_pitch, out):
     """Formatted box of the llpython outputs in the bottom-left corner."""
     if not READOUT:
         return
     scale = image.shape[1] / 640.0
     font, fs, th = cv2.FONT_HERSHEY_SIMPLEX, 0.45 * scale, max(1, int(round(scale)))
     line_h, pad = int(20 * scale), int(8 * scale)
-    color = RED_TEXT if is_red else BLUE_TEXT
     cluster_id, num_tags, rng, bearing, height, elevation, st_pitch, roll = out
+    # Color by the cluster's alliance when one is found, else by the filter.
+    if cluster_id in RED_CLUSTERS or (cluster_id < 0 and alliance == "RED"):
+        color = RED_TEXT
+    elif cluster_id in BLUE_CLUSTERS or (cluster_id < 0 and alliance == "BLUE"):
+        color = BLUE_TEXT
+    else:
+        color = ANY_TEXT
 
     if cluster_id < 0:
-        header = "%s ALLIANCE  -  no cluster   cam pitch %+.1f" % ("RED" if is_red else "BLUE", cam_pitch)
+        header = "%s ALLIANCE  -  no cluster   cam pitch %+.1f" % (alliance, cam_pitch)
         rows = []
     else:
         header = "%s #%d   %d/4 tags   %s   cam pitch %+.1f" % (
@@ -148,10 +186,24 @@ def draw_readout(image, is_red, cam_pitch, out):
 
 
 def runPipeline(image, llrobot):
+    if not UPSIDE_DOWN:
+        return process(image, llrobot)
+    # Analyze and draw on the upright view, then rotate everything back so the
+    # stream (and Limelight's crosshair) stay in the sensor's orientation.
+    contour, upright, out = process(cv2.rotate(image, cv2.ROTATE_180), llrobot)
+    h, w = image.shape[:2]
+    if contour.size:
+        contour = np.array([w - 1, h - 1], np.int32) - contour
+    return contour, cv2.rotate(upright, cv2.ROTATE_180), out
+
+
+def process(image, llrobot):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    is_red = len(llrobot) and int(llrobot[0]) == 1
-    tracked = RED_CLUSTERS if is_red else BLUE_CLUSTERS
-    cam_pitch = float(llrobot[1]) if len(llrobot) > 1 else 0.0
+    if len(llrobot) >= 3 and llrobot[0] != 0:  # robot is sending inputs
+        alliance_code, cam_pitch = int(llrobot[1]), float(llrobot[2])
+    else:
+        alliance_code, cam_pitch = DEFAULT_ALLIANCE, CAM_PITCH
+    alliance, tracked = ALLIANCES.get(alliance_code, ALLIANCES[0])
 
     # Group detected corners by cluster: {base_id: (sticker_pts, image_pts)}
     clusters = {}
@@ -171,7 +223,7 @@ def runPipeline(image, llrobot):
         cv2.polylines(image, [corners.astype(np.int32)], True, (0, 255, 0), 2)
 
     if not clusters:
-        draw_readout(image, is_red, cam_pitch, NO_TARGET)
+        draw_readout(image, alliance, cam_pitch, NO_TARGET)
         return np.array([[]]), image, NO_TARGET
 
     # Closer cluster = the one containing the biggest tag in the image.
@@ -180,13 +232,13 @@ def runPipeline(image, llrobot):
 
     # Undistort the corners to normalized camera coords (x/z, y/z), then solve
     # the cluster pose with planar PnP. The camera matrix is the identity here.
-    K = camera_matrix(gray.shape[1])
-    norm = cv2.undistortPoints(np.vstack(img).reshape(-1, 1, 2), K, CAL_DIST)
+    K, D = camera_model(gray.shape[1], gray.shape[0])
+    norm = cv2.undistortPoints(np.vstack(img).reshape(-1, 1, 2), K, D)
     obj_pts = np.vstack(obj)
     ok, rvec, t = cv2.solvePnP(obj_pts, norm, np.eye(3), None,
                                flags=cv2.SOLVEPNP_IPPE)
     if not ok:
-        draw_readout(image, is_red, cam_pitch, NO_TARGET)
+        draw_readout(image, alliance, cam_pitch, NO_TARGET)
         return np.array([[]]), image, NO_TARGET
     if len(obj) > 1:
         # With 2+ tags, polish the pose with Levenberg-Marquardt on all corners.
@@ -218,7 +270,7 @@ def runPipeline(image, llrobot):
     pts = np.array([[0, 0, 0], [1, 0, 0],
                     [-8.125, -HALF, 0], [8.125, -HALF, 0],
                     [8.125, HALF, 0], [-8.125, HALF, 0]], np.float32)
-    p = cv2.projectPoints(pts, rvec, t, K, CAL_DIST)[0].reshape(-1, 2)
+    p = cv2.projectPoints(pts, rvec, t, K, D)[0].reshape(-1, 2)
     cx, cy = p[0]
     roll = math.degrees(math.atan2(-(p[1][1] - cy), p[1][0] - cx))
 
@@ -227,5 +279,5 @@ def runPipeline(image, llrobot):
     cv2.drawMarker(image, (int(cx), int(cy)), (255, 0, 255), cv2.MARKER_CROSS, 30, 2)
 
     out = [target, len(obj), rng, bearing, height, elevation, st_pitch, roll]
-    draw_readout(image, is_red, cam_pitch, out)
+    draw_readout(image, alliance, cam_pitch, out)
     return outline, image, out

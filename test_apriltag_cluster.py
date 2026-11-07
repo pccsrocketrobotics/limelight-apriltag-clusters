@@ -95,6 +95,11 @@ POSES = [  # name, roll, pitch, yaw, tvec (in)
 ]
 
 
+def inputs(alliance=0, cam_pitch=0.0):
+    """llrobot as the robot sends it: [1 = inputs valid, alliance, camera pitch]."""
+    return [1, alliance, cam_pitch, 0, 0, 0, 0, 0]
+
+
 def expected(right, up, fwd):
     """Expected (range, bearing, height, elevation) for a level-frame position."""
     return (math.hypot(right, fwd), math.degrees(math.atan2(-right, fwd)),
@@ -139,7 +144,7 @@ def main():
             for vis in itertools.combinations(range(4), n):
                 img = render(38, set(vis), rvec, tvec)
                 t0 = time.perf_counter()
-                _, _, py = ac.runPipeline(img, [0])  # default = blue alliance
+                _, _, py = ac.runPipeline(img, inputs(0))  # any alliance, level camera
                 times.append(time.perf_counter() - t0)
                 in_err = math.dist(position(py), truth)
                 worst_in = max(worst_in, in_err)
@@ -159,13 +164,15 @@ def main():
                           % (name, vis, in_err, ang_err, pitch_err, roll_err))
 
     blank = np.full((H, W, 3), 128, np.uint8)
-    assert ac.runPipeline(blank, [0])[2] == ac.NO_TARGET
+    assert ac.runPipeline(blank, inputs(0))[2] == ac.NO_TARGET
     blue = render(38, {0, 1}, euler(0, 0, 0), np.array([0, 0, 24.0]))
-    assert ac.runPipeline(blue, [1])[2] == ac.NO_TARGET  # red ignores blue clusters
-    assert ac.runPipeline(blue, [0])[2][0] == 38
     red = render(34, {2, 3}, euler(0, 0, 0), np.array([0, 0, 24.0]))
-    assert ac.runPipeline(red, [1])[2][0] == 34
-    assert ac.runPipeline(red, [0])[2] == ac.NO_TARGET  # blue ignores red clusters
+    assert ac.runPipeline(blue, inputs(2))[2] == ac.NO_TARGET  # red ignores blue clusters
+    assert ac.runPipeline(red, inputs(1))[2] == ac.NO_TARGET   # blue ignores red clusters
+    assert ac.runPipeline(blue, inputs(1))[2][0] == 38
+    assert ac.runPipeline(red, inputs(2))[2][0] == 34
+    assert ac.runPipeline(blue, inputs(0))[2][0] == 38         # any sees both
+    assert ac.runPipeline(red, inputs(0))[2][0] == 34
 
     # Camera pitch: place the cluster in the level frame (right, up, forward),
     # express it in the pitched camera's frame, render, and check the script
@@ -173,7 +180,7 @@ def main():
     for cam_pitch, level in [(20, (2, 10, 25)), (45, (-3, 20, 20)), (90, (1, 30, 0.0)),
                              (90, (2, 25, -6))]:
         tvec = to_camera(level, cam_pitch)
-        py = ac.runPipeline(render(38, {0, 1, 2, 3}, euler(0, 0, 0), tvec), [0, cam_pitch])[2]
+        py = ac.runPipeline(render(38, {0, 1, 2, 3}, euler(0, 0, 0), tvec), inputs(0, cam_pitch))[2]
         err = math.dist(position(py), level)
         _, exp_bearing, _, exp_elev = expected(*level)
         ang = max(abs(py[3] - exp_bearing), abs(py[5] - exp_elev))
@@ -194,7 +201,7 @@ def main():
         R = np.column_stack([x_cam, np.cross(z_cam, x_cam), z_cam])
         rvec = cv2.Rodrigues(R)[0].ravel()
         py = ac.runPipeline(render(38, {0, 1, 2, 3}, rvec, to_camera(center, cam_pitch)),
-                            [0, cam_pitch])[2]
+                            inputs(0, cam_pitch))[2]
         assert py[0] == 38 and abs(py[6] - tilt) < 2, (tilt, py)
         assert abs(py[2] - 30) < 0.6 and abs(py[4] - 20) < 0.6, (tilt, py)
 
@@ -205,18 +212,71 @@ def main():
     for bad in ({"margin": ac.MIN_DECISION_MARGIN - 1}, {"hamming": ac.MAX_HAMMING + 1}):
         ac.detector.detect = lambda g, bad=bad: [{**d, **bad} for d in real_detect(g)]
         try:
-            assert ac.runPipeline(img, [0])[2] == ac.NO_TARGET, bad
+            assert ac.runPipeline(img, inputs(0))[2] == ac.NO_TARGET, bad
         finally:
             ac.detector.detect = real_detect
-    assert ac.runPipeline(img, [0])[2][:2] == [38, 2]
+    assert ac.runPipeline(img, inputs(0))[2][:2] == [38, 2]
+
+    # Upside-down mount: the sensor frame is the upright view rotated 180 deg
+    # about the lens axis. Render what the sensor sees (with the real, sensor
+    # calibration); with UPSIDE_DOWN = 1 the outputs must match the upright pose.
+    flip = np.diag([-1.0, -1.0, 1.0])
+    ac.UPSIDE_DOWN = 1
+    try:
+        cases = [(r, p, y, t, vis) for (_, r, p, y, t) in POSES[:4]
+                 for vis in ({0, 1, 2, 3}, {1}, {0, 3})]
+        for r, p, y, t, vis in cases:
+            rvec, tvec = euler(r, p, y), np.array(t, float)
+            R_sensor = flip @ cv2.Rodrigues(rvec)[0]
+            raw = render(38, vis, cv2.Rodrigues(R_sensor)[0].ravel(), flip @ tvec)
+            contour, out_img, py = ac.runPipeline(raw.copy(), inputs(0))
+            truth = (tvec[0], -tvec[1], tvec[2])
+            exp_rng, exp_bearing, exp_height, exp_elev = expected(*truth)
+            tol = 0.03 * tvec[2]
+            assert py[0] == 38 and py[1] == len(vis), (r, p, y, vis, py)
+            assert math.dist(position(py), truth) < tol, (r, p, y, vis, py)
+            assert abs(py[3] - exp_bearing) < 0.5 and abs(py[5] - exp_elev) < 0.5, py
+            assert abs(py[6] - sticker_pitch_truth(rvec)) < 5, py
+            assert abs((py[7] + r + 180) % 360 - 180) < 5, py
+            # Stream and contour come back in the sensor's orientation: the
+            # contour matches what normal mode finds on the same sensor image.
+            assert out_img.shape == raw.shape
+            ac.UPSIDE_DOWN = 0
+            normal_contour = ac.runPipeline(raw.copy(), inputs(0))[0]
+            ac.UPSIDE_DOWN = 1
+            assert np.abs(contour.reshape(-1, 2) - normal_contour.reshape(-1, 2)).max() <= 3
+        # Pitched camera, upside down
+        level = (2, 10, 25)
+        tvec = to_camera(level, 20)
+        raw = render(38, {0, 1, 2, 3}, cv2.Rodrigues(flip)[0].ravel(), flip @ tvec)
+        py = ac.runPipeline(raw, inputs(0, 20))[2]
+        assert math.dist(position(py), level) < 0.6, py
+    finally:
+        ac.UPSIDE_DOWN = 0
+
+    # No robot inputs (llrobot all zeros): the script uses CAM_PITCH and
+    # DEFAULT_ALLIANCE. Scene rendered with the camera pitched CAM_PITCH.
+    level = (2, 12, 25)
+    pitched = render(38, {0, 1, 2, 3}, euler(0, 0, 0), to_camera(level, ac.CAM_PITCH))
+    py = ac.runPipeline(pitched.copy(), [0] * 8)[2]
+    assert py[0] == 38 and math.dist(position(py), level) < 0.6, py
+    saved = ac.DEFAULT_ALLIANCE
+    try:
+        ac.DEFAULT_ALLIANCE = 2  # red only: the blue cluster is ignored
+        assert ac.runPipeline(pitched.copy(), [0] * 8)[2] == ac.NO_TARGET
+        # ...but robot inputs (llrobot[0] != 0) override the defaults
+        assert ac.runPipeline(pitched.copy(), inputs(1, ac.CAM_PITCH))[2][0] == 38
+    finally:
+        ac.DEFAULT_ALLIANCE = saved
 
     # Both alliance clusters in view: near one with 1 tag vs far one with 4.
     # The near one (biggest tag) must win.
     near = render(34, {2}, euler(0, 0, 0), np.array([-9, 0, 22.0]))
     far = render(30, {0, 1, 2, 3}, euler(0, 0, 0), np.array([11, 0, 45.0]))
     both = np.where(np.abs(near.astype(int) - 110) > 20, near, far).astype(np.uint8)
-    py = ac.runPipeline(both, [1])[2]
-    assert py[0] == 34 and py[1] == 1, py
+    for alliance in (2, 0):  # red, any
+        py = ac.runPipeline(both.copy(), inputs(alliance))[2]  # runPipeline draws on the image
+        assert py[0] == 34 and py[1] == 1, (alliance, py)
 
     print("%d/%d cases passed, worst position error %.2f in, median runPipeline %.1f ms"
           % (total - failures, total, worst_in, 1000 * sorted(times)[len(times) // 2]))

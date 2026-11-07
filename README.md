@@ -4,7 +4,7 @@
 
 ![The script running in the Limelight web UI: all 4 tags of cluster 42 detected, with the cluster center crosshair and the readout box](Screenshot.png)
 
-A Python SnapScript pipeline for the Limelight 3A. It finds your alliance's **AprilTag Clusters** and reports the **position of the cluster center** from any 1-4 visible tags.
+A Python SnapScript pipeline for the Limelight 3A. It finds **AprilTag Clusters**, optionally only your alliance's, and reports the **position of the cluster center** from any 1-4 visible tags.
 
 | File | Purpose |
 |---|---|
@@ -28,10 +28,16 @@ Optional tuning, at the top of `apriltag_cluster.py`:
 | Setting | Default | Effect |
 |---|---|---|
 | `DECIMATE` | `2.0` | How much the detector shrinks the image while searching for tags. Higher = faster, but tags must be closer to be detected. On a PC at 640×480: 1.0 → 15.6 ms, 2.0 → 3.8 ms with the same range in synthetic tests, 3.0 → 1.7 ms with range down to about 80%, 4.0 → 1.0 ms with range down to about 55%. |
+| `UPSIDE_DOWN` | `0` | Set to `1` if the Limelight is mounted upside down. The script rotates the image 180° for analysis and back after drawing, using a matching calibration. Also set *Stream Orientation* to **Upside-down** so the stream and readout are readable. |
 | `READOUT` | `1` | `1` draws the readout box on the stream. `0` skips it, which is slightly faster, e.g. for matches. |
+| `DEFAULT_ALLIANCE`, `CAM_PITCH` | `0`, `30.0` | Alliance filter and camera pitch, in degrees, used while input 0 is `0`, i.e. no robot is sending inputs |
 | `MIN_DECISION_MARGIN` | `20` | Ignore weakly decoded tags. Lower it if good tags at long range are rejected. Rejected tags are outlined in thin orange. |
 | `MAX_HAMMING` | `1` | Ignore tags that needed more corrected bits than this |
 | `CAL_K`, `CAL_DIST` | from `default.cal` | Camera calibration. See [Recalibrating](#recalibrating). |
+
+Why `UPSIDE_DOWN` is a setting: Limelight's *Stream Orientation* only rotates the video stream. The Python script always receives the unrotated sensor image, and it can't read that setting, so the script needs to be told about the mount.
+
+> **Units:** all distances are in **inches** and all angles, inputs and outputs, are in **degrees** (never radians). Java's `Math.sin`, `Math.cos` and `Math.tan` take radians, so convert with `Math.toRadians()` first.
 
 ## Inputs
 
@@ -39,10 +45,13 @@ Sent from the robot with `limelight.updatePythonInputs(double[])`:
 
 | idx | value |
 |---|---|
-| 0 | **Alliance:** `1` = red (clusters 30 and 34), `0` = blue (clusters 38 and 42). Blue is the default, because inputs are all zeros until the robot sends them. |
-| 1 | **Camera pitch** in degrees, **+ = tilted up** (0 = level, 90 = pointing straight up). Measure it on the robot. |
+| 0 | **Inputs valid:** the robot sends `1`. `0` (the inputs are all zeros until the robot sends something) means the script ignores inputs 1–2 and uses its own `DEFAULT_ALLIANCE` and `CAM_PITCH` instead. |
+| 1 | **Alliance filter:** `0` = any, all 4 clusters. `1` = blue (clusters 38 and 42). `2` = red (clusters 30 and 34). |
+| 2 | **Camera pitch** in degrees, **+ = tilted up** (0 = level, 90 = pointing straight up). Measure it on the robot. |
 
-Only your alliance's two clusters are tracked. If both are in view, the **closer** one is reported, meaning the cluster containing the biggest tag in the image.
+**Testing without a robot:** with the Limelight on USB and no robot sending inputs, the script uses `DEFAULT_ALLIANCE` (default `0`, any) and `CAM_PITCH` (default `30.0`) from the top of the script.
+
+Only the allowed clusters are tracked. If several are in view, the **closest** one is reported, meaning the cluster containing the biggest tag in the image.
 
 ## Outputs
 
@@ -61,7 +70,7 @@ Read with `result.getPythonOutput()` (8 values):
 
 * Everything is measured from the camera lens and corrected for the camera pitch, as if the camera were level.
 * Range is measured along the floor, so it doesn't include height. That differs slightly from the SDK's range, which is measured in the camera's own tilted view.
-* If you need them, right and forward can be rebuilt: `right = -range·sin(bearing)`, `forward = range·cos(bearing)`.
+* If you need them, right and forward can be rebuilt: `right = -range·sin(bearing)` and `forward = range·cos(bearing)`. In Java, use `Math.sin(Math.toRadians(bearing))`.
 * When the cluster is nearly straight overhead (range ≈ 0), bearing and elevation are unreliable, so use range and height.
 * The pipeline also returns the cluster outline as its target. Limelight's standard tx/ty/ta, shown under the stream, aim at the cluster center but are **not** pitch-corrected.
 
@@ -74,26 +83,26 @@ Read with `result.getPythonOutput()` (8 values):
 ### The preview readout
 
 The bottom-left box in the stream shows the same outputs:
-- **Header:** cluster name and ID, tags seen, upright or upside down, and the pitch the robot sent.
+- **Header:** cluster name and ID, tags seen, upright or upside down, and the camera pitch the robot sent, in degrees.
 - **Rows:** range/bearing, height/elevation, sticker pitch/roll.
 
 Green outlines are tags in use, thin orange outlines are rejected tags, and the magenta cross is the cluster center.
 
 ## Sample Java code
 
-`ClusterCenterTeleOp.java` is a complete OpMode. Pick the alliance during init with **B = red** or **X = blue**. The essential parts:
+`ClusterCenterTeleOp.java` is a complete OpMode. Pick the alliance during init with **B = red**, **X = blue** or **A = any**. The essential parts:
 
 ```java
 private static final int CLUSTER_PIPELINE = 1;        // pipeline slot in the web UI
-private static final double CAMERA_PITCH_DEG = 18.0;  // + = tilted up; measure on the robot
-private static final double RED = 1, BLUE = 0;
+private static final double CAMERA_PITCH_DEG = 30.0;  // + = tilted up; measure on the robot
+private static final double ANY = 0, BLUE = 1, RED = 2;
 
 Limelight3A limelight = hardwareMap.get(Limelight3A.class, "limelight");
 limelight.pipelineSwitch(CLUSTER_PIPELINE);
 limelight.start();
 
-// Inputs: [0] alliance, [1] camera pitch
-limelight.updatePythonInputs(new double[] {alliance, CAMERA_PITCH_DEG, 0, 0, 0, 0, 0, 0});
+// Inputs: [0] 1 = valid, [1] alliance, [2] camera pitch in degrees
+limelight.updatePythonInputs(new double[] {1, alliance, CAMERA_PITCH_DEG, 0, 0, 0, 0, 0});
 
 LLResult result = limelight.getLatestResult();
 double[] py = (result != null) ? result.getPythonOutput() : null;
@@ -107,7 +116,7 @@ if (py != null && py.length >= 8 && py[0] >= 0) {
     double stickerPitch = py[6];  // degrees, 0 = flat (hive level)
     double roll = py[7];          // degrees, |roll| < 90 = right-side up
 } else {
-    // no cluster of our alliance in view
+    // no allowed cluster in view
 }
 ```
 
@@ -126,7 +135,7 @@ if (py != null && py.length >= 8 && py[0] >= 0) {
 
 ### The math
 
-1. **Detect and filter.** AprilTag3 finds the tags. Tags from the other alliance and weak detections are dropped, and the rest are grouped by cluster.
+1. **Detect and filter.** AprilTag3 finds the tags. Tags from clusters outside the alliance filter and weak detections are dropped, and the rest are grouped by cluster.
 2. **Undistort.** Each tag's 4 corners are converted to normalized camera coordinates, using the calibration and removing lens distortion.
 3. **Solve the pose.** Each corner's position on the sticker is known exactly. `solvePnP` (IPPE, for planar targets) finds the cluster's pose, with the **cluster center as the origin**, using every visible corner.
    - One tag (4 corners) is enough.
@@ -134,11 +143,11 @@ if (py != null && py.length >= 8 && py[0] >= 0) {
    - This still works when the center is in the blank gap between the middle tags.
 4. **Correct for camera pitch.** The center's position is rotated out of the camera's tilted view into a level one: right, up and forward. From that:
    - `range = hypot(right, forward)`
-   - `bearing = atan2(-right, forward)`
+   - `bearing = atan2(-right, forward)`, converted to degrees
    - `height = up`
-   - `elevation = atan2(up, forward)`
-5. **Sticker pitch.** The direction the printed face points comes from the solved rotation, rotated the same way. Sticker pitch is its angle away from straight down, positive when it tilts toward the camera.
-6. **Roll.** The center and a point 1 in along the cluster's x-axis are projected into the image. Roll is the angle of the line between them.
+   - `elevation = atan2(up, forward)`, converted to degrees
+5. **Sticker pitch.** The direction the printed face points comes from the solved rotation, rotated the same way. Sticker pitch is its angle away from straight down, in degrees, positive when it tilts toward the camera.
+6. **Roll.** The center and a point 1 in along the cluster's x-axis are projected into the image. Roll is the angle of the line between them, in degrees.
 
 Example: with the camera pitched up 18°, a cluster 13.7° above the image center reports elevation = 18 + 13.7 ≈ 31.7°. This is exact when bearing ≈ 0.
 
@@ -160,6 +169,7 @@ What it checks:
 - 6 poses × all 15 visible-tag subsets, comparing range, bearing, height, elevation, sticker pitch and roll against ground truth
 - camera pitch correction
 - a tilted hive: sticker pitch of 0°, +20°, −15° and +45°, with the camera pitched 30°
+- an upside-down mount (`UPSIDE_DOWN = 1`), level and pitched, checking that the outputs match the upright view and that the stream and target outline come back in the sensor's orientation
 - alliance filtering
 - weak-detection filtering
 - near-vs-far cluster selection

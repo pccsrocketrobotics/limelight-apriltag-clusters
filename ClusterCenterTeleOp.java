@@ -13,7 +13,7 @@ import com.qualcomm.robotcore.eventloop.opmode.TeleOp;
  * Reads the AprilTag Cluster center computed by apriltag_cluster.py running
  * as a Python (SnapScript) pipeline on the Limelight 3A.
  *
- * During init, gamepad 1: B = red alliance, X = blue alliance.
+ * During init, gamepad 1: B = red alliance, X = blue alliance, A = any (no filter).
  */
 @TeleOp(name = "Cluster Center", group = "Vision")
 public class ClusterCenterTeleOp extends LinearOpMode {
@@ -23,12 +23,13 @@ public class ClusterCenterTeleOp extends LinearOpMode {
 
     // Camera pitch in degrees, + = tilted up (0 = level, 90 = straight up).
     // Measure this on the robot.
-    private static final double CAMERA_PITCH_DEG = 18.0;
+    private static final double CAMERA_PITCH_DEG = 30.0;
 
-    // llrobot[0] values
-    private static final double RED = 1, BLUE = 0;
+    // Python input [1] values
+    private static final double ANY = 0, BLUE = 1, RED = 2;
 
-    // llpython layout (must match apriltag_cluster.py)
+    // llpython layout (must match apriltag_cluster.py). Distances are in inches,
+    // angles in degrees: use Math.toRadians() before Math.sin/cos/tan.
     private static final int CLUSTER_ID = 0, NUM_TAGS = 1, RANGE = 2, BEARING = 3,
             HEIGHT = 4, ELEVATION = 5, STICKER_PITCH = 6, ROLL = 7;
 
@@ -38,14 +39,18 @@ public class ClusterCenterTeleOp extends LinearOpMode {
         limelight.pipelineSwitch(CLUSTER_PIPELINE);
         limelight.start();
 
-        double alliance = BLUE;
+        double alliance = ANY;
         while (opModeInInit()) {
             if (gamepad1.b) alliance = RED;
             if (gamepad1.x) alliance = BLUE;
-            telemetry.addData("Alliance (B red / X blue)", alliance == BLUE ? "BLUE" : "RED");
+            if (gamepad1.a) alliance = ANY;
+            telemetry.addData("Alliance (B red / X blue / A any)",
+                    alliance == RED ? "RED" : alliance == BLUE ? "BLUE" : "ANY");
             telemetry.update();
         }
-        limelight.updatePythonInputs(new double[] {alliance, CAMERA_PITCH_DEG, 0, 0, 0, 0, 0, 0});
+        // Inputs: [0] 1 = inputs valid (0 makes the script use its own defaults),
+        // [1] alliance, [2] camera pitch in degrees
+        limelight.updatePythonInputs(new double[] {1, alliance, CAMERA_PITCH_DEG, 0, 0, 0, 0, 0});
 
         while (opModeIsActive()) {
             LLResult result = limelight.getLatestResult();
